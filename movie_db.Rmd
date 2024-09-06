@@ -1,0 +1,215 @@
+---
+title: "Stale Peaches Movie Review Database"
+author: "Kevin Havis"
+date: "2024-08-31"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# The Stale Peaches Movie Review Database
+
+Today we'll be building a database that can dynamically handle movie reviews that have been submitted to our company, Stale Peaches, which is well known for publishing fair and honest takes from critics and fans alike.
+
+Reviewers will submit their reviews via our movie survey Google Form. These collected responses cover reviews from our valued critics on some of the most popular movies in recent years, rating them from "Great" to "Bad".
+
+To get a better sense of our critic's tastes, we've also invited them to offer their favorite movie.
+
+Our database will composed of three tables;
+
+1. The `movies` table, which will contain information about specific movies. This will allows us to add new movies in the future
+2. The `reviewers` table, which will contain information about our critics, such as name and favorite movie
+3. The `reviews` table, which contains both the movies, the reviewers, and their reviews
+
+## Loading the survey data
+
+We could access the Google Sheet directly, but for convenience we've extracted the results into the "movie_survey_responses.csv" file.
+
+```{r echo=FALSE, message=FALSE}
+library(DBI)
+library(dbplyr)
+library(tidyverse)
+```
+
+```{r}
+movies <- read_csv("movie_survey_responses.csv")
+
+glimpse(movies)
+```
+
+Unfortunately the formatting Google has stored the reviews in is not ideal for a SQL database. The movies are stored as columns along with the reviewer names and their favorite movies, and the actual scores are stored as values.
+
+We will need to do some data transformation in order to allow this data to sit neatly in our three tables. Let's start with the `movies` table
+
+## The movies table
+
+```{r}
+# Drop time stamp column and clean column names
+movies <- movies |> 
+  select(everything(), -Timestamp) |> 
+  rename('reviewer_name' = 'First Name', 'favorite_movie' = 'What is your favorite movie of all time?')
+```
+
+```{r}
+# Extract movies into a new tibble
+movie_table <- tibble(names(movies)) |> 
+  rename('film' = 'names(movies)') |> 
+  filter(film != 'reviewer_name' & film != 'favorite_movie')
+
+glimpse(movie_table)
+
+```
+
+We've extracted the reviewed movies, but we'd also like to capture our reviewer's favorite movies and add them as well. 
+
+```{r}
+# Extract favorite movies and append to move_table
+fav_movies <- movies |> 
+  select(favorite_movie) |>
+  filter(!is.na(favorite_movie)) |> 
+  rename('film' = 'favorite_movie') # allows us to join with movie_table
+
+# Append favorite movies to the movie table
+movie_table <- bind_rows(movie_table, fav_movies)
+
+glimpse(movie_table)
+```
+
+Now we have our complete and well-structured `movies` table. We'll add this to our database later. Let's continue on with our remaining two tables.
+
+## The reviews table
+
+We've asked reviewers to submit their reviews as a qualitative measure, such as "Poor" or "Good". We'll keep these values, but we should also add a corresponding numerical value. This will allow us to calcualte metrics down the road.
+
+```{r}
+# Reformat the reviews table
+reviews_table <- movies |> 
+  pivot_longer(cols =(0:8), names_to = 'film', values_to = 'rating') |> 
+  select(everything(), -'favorite_movie')
+
+# Add numerical rating field
+reviews_table <- reviews_table |> 
+  mutate(num_rating = case_when(
+    rating == 'Great' ~ 5,
+    rating == 'Good' ~ 4,
+    rating == 'Okay' ~ 3,
+    rating == 'Poor' ~ 2,
+    rating == 'Bad' ~ 1,
+    TRUE ~ NA
+  ))
+
+```
+
+The reviews table is done! Let's move on to our last table; the reviewers themselves.
+
+## The reviewers table
+
+As mentioned before, we'd like to capture both the reviewer and their favorite movie. This gives us a better understanding of each reviewer's unique tastes, which could be useful if we later choose to develop a recommender service; fans who have similar tastes to a critics will be recommended movies the critic enjoys more often.
+
+```{r}
+# Get reviewer names
+reviewer_table <- movies |> 
+  select(reviewer_name, favorite_movie)
+```
+
+## Building the database
+
+So far we've been able to dynamically format and clean the data into three datasets, but they are only in memory. We will now build a locally hosted database and add these tables.
+
+```{r}
+# Initialize the database connection
+con <- DBI::dbConnect(duckdb::duckdb(), dbdir = "stale_peaches")
+```
+
+```{r}
+# Write our in-memory datasets to the actual database tables
+dbWriteTable(con, "movies", movie_table, overwrite = TRUE)
+
+dbWriteTable(con, "reviews", reviews_table, overwrite = TRUE)
+
+dbWriteTable(con, "reviewers", reviewer_table, overwrite = TRUE)
+
+```
+
+
+```{r}
+# Review our databases tables
+dbListTables(con)
+```
+
+Our database has been properly set up and can be appropriately scaled, queried, an even uploaded to a cloud database easily.
+
+## Using our new data asset
+
+Now that we have this data in a proper database, we can build some generic reporting to answer interesting questions about our reviewers and their preferences.
+
+### What are our reviewer's tendencies in review scores?
+
+```{r}
+tbl(con, sql(
+  '
+  SELECT reviewer_name, MEAN(num_rating)
+  FROM reviews
+  GROUP BY reviewer_name
+  '
+))
+```
+Interestingly, we can see that Corey has not seen any of these movies, and Keith has a very generous average rating of 5 / 5!
+
+Let's see what Keith's movie preferences are by checking their record in the `reviewers` table.
+
+```{r}
+tbl(con, sql(
+  "
+  SELECT *
+  FROM reviewers
+  WHERE reviewer_name = 'Keith'
+  "
+))
+```
+
+We'll assume that's the Lord of the Rings trilogy as a collective; it's hard to choose one.
+
+Do we see them rating recent fantasy-adjacent movies highly?
+
+```{r}
+tbl(con, sql(
+  "
+  SELECT *
+  FROM reviews
+  WHERE reviewer_name = 'Keith'
+  "
+))
+```
+
+Interestingly, Keith has only reviewed Oppenheimer, a historical-event based drama on the creation of the atom bomb, and quite different from Lord of the Rings. We can see now why his mean rating was 5 - it was the only rating.
+
+```{r}
+dbDisconnect(con)
+```
+
+
+## Conclusion
+
+In this article, we created an end-to-end process to store movie reviews in our Stale Peaches database. We took the below steps;
+
+- Designed a survey for movie critics
+- Built a dynamic and low-cost intake solution via Google Forms
+- Performed data transformation to standardize and enhance our data to make it more scalable and discoverable
+- Built a working database prototype with appropriate design and schemas
+- Used our new data asset to find interesting patterns in our critic's movie habits
+
+## Future iterations
+
+Some ideas for future iterations of this project;
+
+- Add additional features to our tables, such as producers, actors, genres, etc.
+- Migrate to a more robust DBMS solution to allow for more complex schemas and data
+- Incorporate cloud based services to allow for scalability
+- With sufficient data, build a recommender system to suggest like-minded critics and movies to audience members 
+
+
+
+
